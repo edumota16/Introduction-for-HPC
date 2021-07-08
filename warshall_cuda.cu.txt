@@ -1,0 +1,272 @@
+%%cu
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <assert.h>
+
+#define QTD_ELEMENTOS 1024
+#define NUM_THREADS_BLOCK_X 16
+#define NUM_THREADS_BLOCK_Y 16
+
+inline cudaError_t checkCuda(cudaError_t result)
+{
+  if (result != cudaSuccess) {
+    fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+    assert(result == cudaSuccess);
+  }
+  return result;
+}
+
+void inicializaMatriz(int *data, unsigned size)
+{
+  time_t t;
+  srand((unsigned int) time(&t));
+  for (int i=0; i<size; i++) {
+     for (int j=0; j<size; j++) {
+       //data[i * size + j] = (int)( rand() & 0xFF )/10.0f;
+       data[i * size + j] = ((int)rand() ) % 2;
+     }
+  }
+}
+
+
+void warshallCPU(int* fechoMatriz, unsigned n)
+{   
+    for(int k = 0; k < n; k++){
+      for(int i = 0; i < n; i++){
+        for(int j = 0; j < n; j++){
+            if(fechoMatriz[k * n + j] == 1 && fechoMatriz[i * n + k] == 1)  
+              fechoMatriz[i * n + j] = 1;
+        }     
+      }         
+    }
+}
+
+
+void processamentoCPU(int *A, unsigned n)
+{
+  int* F = (int*) malloc( sizeof(int) * n * n);
+
+  double tempoGasto;
+  clock_t start = clock();
+
+  warshallCPU(F, n);
+
+  clock_t stop = clock();
+
+  tempoGasto = 1000 *  (stop - start) / (float) CLOCKS_PER_SEC;
+  printf("Tempo de execução da CPU: %f ms\n", tempoGasto );
+
+  free(F);
+}
+
+
+//Define o kernel 01
+__global__ void warshallKernel(int* F, int k, unsigned n){
+
+  int indexColuna = blockIdx.x * blockDim.x + threadIdx.x;
+  int indexLinha = blockIdx.y * blockDim.y + threadIdx.y;
+      
+      if(F[k * n + indexColuna] == 1 && F[indexLinha * n + k] == 1)
+          F[indexLinha * n + indexColuna] = 1;            
+}
+
+//Define o kernel 02
+__global__ void warshallKernelMelhorado(int* N, int k, unsigned n){
+
+  int indexColuna = blockIdx.x * blockDim.x + threadIdx.x;
+  int indexLinha = blockIdx.y * blockDim.y + threadIdx.y;
+
+//Mesmo tamanho do bloco que está processando, no eixo x e no eixo y
+  __shared__ int ladrilhoA [NUM_THREADS_BLOCK_Y][NUM_THREADS_BLOCK_X];
+  __shared__ int ladrilhoB [NUM_THREADS_BLOCK_Y][NUM_THREADS_BLOCK_X];
+
+  int tidX;
+  int tidY;
+
+  tidX = blockIdx.x * blockDim.x + threadIdx.x;
+  tidY = k * blockDim.y + threadIdx.y;
+  ladrilhoA[threadIdx.y][threadIdx.x] = N[tidY * n + tidX];
+  
+  tidX = k * blockDim.x + threadIdx.x;
+  tidY = blockIdx.y * blockDim.y + threadIdx.y;
+  ladrilhoB[threadIdx.y][threadIdx.x] = N[tidY * n + tidX];
+
+  __syncthreads();
+
+  for(int m=0; m < blockDim.x; m++){
+    if(ladrilhoA[m][threadIdx.x] == 1 && ladrilhoB[threadIdx.y][m] == 1){
+      N[indexLinha * n + indexColuna] = 1;
+    }
+  __syncthreads();
+  }               
+}
+
+
+__host__ void processamentoGPU(int *F, unsigned n)
+{
+  int numeroBytes = sizeof(int) * n * n;
+
+  //----------Aloca espaço na CPU para  o resultado-----------
+  
+  int *A = (int*) malloc(numeroBytes);
+
+  //------------Declaração de ponteiros para a GPU------------
+  
+  int* gpuF;
+
+  //------------Alocar espaços na memória GPU------------
+  
+  cudaMalloc( (void**) &gpuF, numeroBytes);
+
+  //------------Transferir os dados para o espaço alocado na GPU------------
+ 
+  cudaMemcpy(gpuF, F, numeroBytes, cudaMemcpyHostToDevice);
+  
+  //------------Dimensão da grade e do bloco---------------
+  
+  dim3 bloco = dim3(NUM_THREADS_BLOCK_X, NUM_THREADS_BLOCK_Y);
+  dim3 grid = dim3(ceil (n/ NUM_THREADS_BLOCK_X), ceil (n/ NUM_THREADS_BLOCK_Y));
+  
+  //---------Eventos para obter o tempo de execução----------
+  
+  cudaEvent_t start, stop;
+  float gpu_time = 0.0f;
+  checkCuda( cudaEventCreate(&start) );
+  checkCuda( cudaEventCreate(&stop) );
+  checkCuda( cudaEventRecord(start, 0) );
+
+  //--------------Lançamento do kernel--------------
+  
+  for(int k = 0; k < n; k++){
+    warshallKernel<<< grid, bloco >>>(gpuF, k, n);
+    cudaDeviceSynchronize();
+  }
+   
+  //---------Obtém o erro de lançamento de kernel---------
+
+  cudaError_t error = cudaGetLastError();
+  checkCuda( error );
+
+  //-----Eventos que marcam o tempo de final de execução do kernel-----
+  
+  checkCuda( cudaEventRecord(stop, 0) );
+  checkCuda( cudaEventSynchronize(stop) );
+  checkCuda( cudaEventElapsedTime(&gpu_time, start, stop) );
+  
+  //------------Transferir o resultado para a CPU------------
+  
+  cudaMemcpy(A, gpuF, numeroBytes, cudaMemcpyDeviceToHost);
+
+  //---------Liberando o espaço na memória da GPU----------
+  
+  cudaFree(gpuF);
+
+  //---------------Imprime o resultado---------------
+  
+  printf("Tempo de Execução na GPU: %.4f ms \n\n", gpu_time); 
+}
+
+
+__host__ void processamentoGPUMelhorado(int *N, unsigned n)
+{
+  int numeroBytes = sizeof(int) * n * n;
+
+  //----------Aloca espaço na CPU para  o resultado-----------
+  
+  int *M = (int*) malloc(numeroBytes);
+
+  //------------Declaração de ponteiros para a GPU------------
+  
+  int* gpuN;
+
+  //------------Alocar espaços na memória GPU------------
+  
+  cudaMalloc( (void**) &gpuN, numeroBytes);
+
+  //------------Transferir os dados para o espaço alocado na GPU------------
+ 
+  cudaMemcpy(gpuN, N, numeroBytes, cudaMemcpyHostToDevice);
+  
+  //------------Dimensão da grade e do bloco---------------
+  
+  dim3 bloco = dim3(NUM_THREADS_BLOCK_X, NUM_THREADS_BLOCK_Y);
+  dim3 grid = dim3(ceil (n/ NUM_THREADS_BLOCK_X), ceil (n/ NUM_THREADS_BLOCK_Y));
+  
+  //---------Eventos para obter o tempo de execução----------
+  
+  cudaEvent_t start, stop;
+  float gpu_time = 0.0f;
+  checkCuda( cudaEventCreate(&start) );
+  checkCuda( cudaEventCreate(&stop) );
+  checkCuda( cudaEventRecord(start, 0) );
+
+  //--------------Lançamento do kernel--------------
+
+//A abordagem aqui é que o k não percorre mais a matriz toda, mas se fixa nos números de blocos
+  
+  for(int k = 0; k < bloco.x; k++){
+    warshallKernelMelhorado<<<grid, bloco>>>(gpuN, k, n);    
+    cudaDeviceSynchronize();
+  }
+ 
+  //---------Obtém o erro de lançamento de kernel---------
+
+  cudaError_t error = cudaGetLastError();
+  checkCuda( error );
+
+  //-----Eventos que marcam o tempo de final de execução do kernel-----
+  
+  checkCuda( cudaEventRecord(stop, 0) );
+  checkCuda( cudaEventSynchronize(stop) );
+  checkCuda( cudaEventElapsedTime(&gpu_time, start, stop) );
+  
+  //------------Transferir o resultado para a CPU------------
+  
+  cudaMemcpy(M, gpuN, numeroBytes, cudaMemcpyDeviceToHost);
+
+  //---------Liberando o espaço na memória da GPU----------
+  
+  cudaFree(gpuN);
+
+  //---------------Imprime o resultado---------------
+  
+  printf("Tempo de Execução na GPUMelhorado: %.4f ms \n\n", gpu_time);
+}
+
+
+void mainWarshall()
+{
+
+  int byteNumber = QTD_ELEMENTOS * QTD_ELEMENTOS * sizeof(int);
+
+  int *A = (int*) malloc(byteNumber);
+
+  inicializaMatriz(A, QTD_ELEMENTOS);
+  processamentoCPU(A, QTD_ELEMENTOS);
+  processamentoGPU(A, QTD_ELEMENTOS);
+  processamentoGPUMelhorado(A, QTD_ELEMENTOS);
+ 
+  int soma = 0;
+  for (int i=0; i< QTD_ELEMENTOS; i++)
+    for (int j=0; j< QTD_ELEMENTOS; j++)
+      soma += A[i * QTD_ELEMENTOS + j];
+  printf("Total de arestas: %d \n ",soma);
+  
+  free(A);
+}
+
+int main(void)
+{
+ 
+  cudaSetDevice(0);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop,0);
+  printf("Número de SMs: %d\n",prop.multiProcessorCount);
+  printf("Modelo do Device: %s\n\n\n",prop.name);
+
+  mainWarshall();
+
+  return 0;
+}
